@@ -42,7 +42,7 @@ import streamlit as st
 # ============================================================
 # Configuration
 # ============================================================
-ARTIFACT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artifacts")
+ARTIFACT_DIR = ARTIFACT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 LAT, LON = 24.3636, 88.6241
 TZ_OFFSET_HOURS = 6  # Asia/Dhaka is UTC+6, no DST
