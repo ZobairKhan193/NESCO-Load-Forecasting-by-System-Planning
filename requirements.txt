@@ -1,0 +1,15 @@
+# Keep these close to the versions printed by train.ipynb cell 1 in Colab,
+# so the pickled model/scalers load cleanly. Update if Colab's versions move.
+streamlit>=1.38
+pandas>=2.2
+numpy>=2.0
+scikit-learn>=1.6
+xgboost==3.2.0
+requests>=2.32
+matplotlib>=3.9
+joblib>=1.4
+
+# Only needed if a deep-learning model (BiGRU/BiLSTM/CNN-LSTM) wins training
+# and best_model.keras is the saved artifact. Leave commented while XGBoost
+# is the chosen model — it keeps the app small and fast to deploy.
+# tensorflow-cpu==2.20.*
