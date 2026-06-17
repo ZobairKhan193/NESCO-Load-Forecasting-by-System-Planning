@@ -27,6 +27,7 @@ The forecasting logic is identical to forecast.ipynb:
   - bias correction from config.json added to every prediction
 """
 
+import io
 import json
 import math
 import os
@@ -56,6 +57,61 @@ LAT, LON = 24.3636, 88.6241
 TZ_OFFSET_HOURS = 6  # Asia/Dhaka is UTC+6, no DST
 WEATHER_VARS = ["temperature_2m", "relative_humidity_2m", "precipitation",
                 "wind_speed_10m", "cloud_cover"]
+
+# ---- OIS output format ----
+# OIS expects reactive power (MVAR) and half-hourly points in the evening peak.
+POWER_FACTOR = 0.9                                   # cos(phi)
+MVAR_FACTOR = math.sqrt(1 - POWER_FACTOR**2) / POWER_FACTOR   # tan(arccos(0.9)) ~= 0.48432
+HALF_HOUR_SLOTS = ["18:30", "19:30"]                 # extra points OIS needs at evening peak
+
+
+def build_ois_table(forecast_df, target_day):
+    """Convert the 24-hour forecast into the OIS upload layout:
+    columns [date_time(<date>), Forecast (MW), Forecast (MVAR)], hourly rows
+    00:00..23:00 plus half-hourly rows (averaged from the adjacent hours),
+    MVAR = MW * tan(arccos(power factor))."""
+    mw = {ts.strftime("%H:%M"): float(v)
+          for ts, v in zip(forecast_df["datetime"], forecast_df["forecasted_load"])}
+    # Half-hourly = average of the immediate previous and next hourly values
+    for slot in HALF_HOUR_SLOTS:
+        h = int(slot[:2])
+        mw[slot] = (mw[f"{h:02d}:00"] + mw[f"{h+1:02d}:00"]) / 2.0
+    labels = sorted(mw, key=lambda x: (int(x[:2]), int(x[3:])))
+    rows = []
+    for lab in labels:
+        v = round(mw[lab], 2)
+        rows.append((lab, v, round(v * MVAR_FACTOR, 2)))
+    return pd.DataFrame(
+        rows, columns=[f"date_time({target_day})", "Forecast (MW)", "Forecast (MVAR)"]
+    )
+
+
+def models_table(config):
+    """Build the per-model accuracy table from config (robust to old/new keys)."""
+    holdout = {r["model"]: r
+               for r in config.get("holdout_leaderboard", config.get("leaderboard", []))}
+    backtest = config.get("backtest_leaderboard", {})
+    names = list(dict.fromkeys(list(backtest.keys()) + list(holdout.keys())))
+    rows = []
+    for n in names:
+        rows.append({
+            "Model": n,
+            "Day-ahead MAPE (%)": round(backtest[n], 2) if n in backtest else None,
+            "Holdout MAPE (%)": round(holdout[n]["MAPE"], 2) if n in holdout else None,
+        })
+    df = pd.DataFrame(rows)
+    sort_col = ("Day-ahead MAPE (%)" if df.get("Day-ahead MAPE (%)") is not None
+                and df["Day-ahead MAPE (%)"].notna().any() else "Holdout MAPE (%)")
+    return df.sort_values(sort_col, na_position="last").reset_index(drop=True)
+
+
+def best_model_info(config):
+    """Return (best_name, best_day_ahead_mape) from config."""
+    best_name = config.get("model_name", "?")
+    mape = config.get("selected_backtest_mape")
+    if mape is None:
+        mape = config.get("backtest_leaderboard", {}).get(best_name)
+    return best_name, mape
 
 st.set_page_config(
     page_title="Load Forecast by Planning",
@@ -374,8 +430,39 @@ def run_forecast(target_day, config, feat_scaler, target_scaler, model,
 # ============================================================
 # UI
 # ============================================================
-st.title("⚡ Load Forecast by Planning")
-st.caption("NESCO System Planning · Rajshahi Zone hourly load | powered by Open-Meteo weather + ML")
+st.markdown("""
+<style>
+#MainMenu, footer {visibility: hidden;}
+.block-container {padding-top: 2rem;}
+.app-banner {
+    background: linear-gradient(100deg, #0b3d2e 0%, #11705a 60%, #0d8f6f 100%);
+    padding: 20px 26px; border-radius: 14px; margin-bottom: 14px;
+    border: 1px solid rgba(255,255,255,0.10);
+    box-shadow: 0 4px 18px rgba(0,0,0,0.25);
+}
+.app-banner h1 {margin: 0; font-size: 30px; color: #ffffff; font-weight: 800;
+    letter-spacing: .3px;}
+.app-banner p {margin: 6px 0 0 0; color: #d6efe7; font-size: 13.5px;}
+div[data-testid="stMetric"] {
+    background: rgba(255,255,255,0.035);
+    border: 1px solid rgba(255,255,255,0.09);
+    border-radius: 12px; padding: 12px 16px;
+}
+.best-badge {display:inline-block; background:#0d8f6f; color:#fff;
+    padding:3px 12px; border-radius:14px; font-size:13px; font-weight:700;}
+.app-footer {text-align:center; color:#8595a1; font-size:12px;
+    margin-top: 34px; padding-top: 14px;
+    border-top: 1px solid rgba(255,255,255,0.08);}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<div class="app-banner">
+  <h1>⚡ Load Forecast by Planning</h1>
+  <p>NESCO System Planning · Rajshahi Zone — 24-hour hourly load forecast &nbsp;|&nbsp;
+     powered by Open-Meteo weather + Machine Learning</p>
+</div>
+""", unsafe_allow_html=True)
 
 # Load artifacts up front so errors show immediately
 try:
@@ -393,16 +480,29 @@ with st.sidebar:
         st.session_state.clear()
         st.rerun()
     st.divider()
-    st.header("Model info")
+
+    _best_name, _best_mape = best_model_info(config)
+    _mape_txt = f"{_best_mape:.2f}% MAPE" if _best_mape is not None else "n/a"
+    st.subheader("🏆 Best model")
+    st.markdown(f"<span class='best-badge'>{_best_name}</span> &nbsp; "
+                f"<b>{_mape_txt}</b>", unsafe_allow_html=True)
+    st.caption("Day-ahead accuracy, chosen by walk-forward backtest.")
+
+    st.divider()
+    st.subheader("ℹ️ Details")
     st.markdown(
         f"""
-- **Model:** {config['model_name']}
 - **Trained:** {config.get('trained_at', 'unknown')[:10]}
-- **Training data through:** {config.get('data_range', {}).get('end', 'unknown')[:10]}
-- **Last actual in history:** {last_actual:%Y-%m-%d %H:%M}
-- **Holdout MAPE:** {min(r['MAPE'] for r in config.get('leaderboard', [{'MAPE': float('nan')}])):.2f}%
+- **Data through:** {config.get('data_range', {}).get('end', 'unknown')[:10]}
+- **Last actual:** {last_actual:%Y-%m-%d %H:%M}
 """
     )
+
+    with st.expander("📊 Models tested (accuracy)"):
+        st.dataframe(models_table(config), hide_index=True, use_container_width=True)
+        st.caption("Lower MAPE = better. *Day-ahead* = realistic iterative error; "
+                   "*Holdout* = optimistic teacher-forced error.")
+
     staleness = (_today - last_actual.date()).days
     if staleness > 10:
         st.warning(
@@ -472,28 +572,69 @@ if go:
         fig.tight_layout()
         st.pyplot(fig)
 
-        # ---- Table + download ----
-        show_df = forecast_df.copy()
-        show_df["datetime"] = show_df["datetime"].dt.strftime("%Y-%m-%d %H:%M")
-        show_df["forecasted_load"] = show_df["forecasted_load"].round(2)
+        # ---- OIS table + download (ready to upload to OIS) ----
+        ois_df = build_ois_table(forecast_df, target_day)
+
+        # Build an .xlsx in memory matching the OIS layout (sheet name "forecast")
+        xbuf = io.BytesIO()
+        with pd.ExcelWriter(xbuf, engine="openpyxl") as writer:
+            ois_df.to_excel(writer, index=False, sheet_name="forecast")
+        xbuf.seek(0)
 
         tcol, dcol = st.columns([2, 1])
         with tcol:
-            st.dataframe(show_df, use_container_width=True, height=420)
+            st.dataframe(ois_df, use_container_width=True, height=460)
         with dcol:
             st.download_button(
-                "⬇️ Download CSV",
-                data=show_df.to_csv(index=False).encode("utf-8"),
+                "⬇️ Download OIS file (.xlsx)",
+                data=xbuf.getvalue(),
+                file_name=f"NESCO-Raj_forecast_{target_day}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+            st.download_button(
+                "⬇️ Plain CSV (hourly only)",
+                data=ois_df.to_csv(index=False).encode("utf-8"),
                 file_name=f"forecast_{target_day}.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
+            st.caption(f"MVAR at power factor {POWER_FACTOR} · "
+                       f"half-hourly = average of adjacent hours")
 
     except Exception as e:
         st.error(f"Forecast failed: {e}")
         st.exception(e)
 else:
-    st.markdown(
+    st.info(
         "👈 Pick a date and click **Generate Forecast** to produce the "
-        "24-hour hourly load forecast."
+        "OIS-ready 24-hour forecast (MW + MVAR, with evening half-hourly points)."
     )
+    _bn, _bm = best_model_info(config)
+    _bm_txt = f"{_bm:.2f}% MAPE" if _bm is not None else "n/a"
+    c1, c2 = st.columns([1, 1.3])
+    with c1:
+        st.markdown("#### 🏆 Selected model")
+        st.markdown(
+            f"<span class='best-badge'>{_bn}</span> &nbsp; "
+            f"day-ahead accuracy ≈ <b>{_bm_txt}</b>", unsafe_allow_html=True)
+        st.caption(
+            "Chosen automatically from the models below by a walk-forward "
+            "day-ahead backtest over the last 14 days (lower MAPE = better)."
+        )
+    with c2:
+        st.markdown("#### 📊 Models evaluated")
+        _mt = models_table(config)
+        _sty = _mt.style.apply(
+            lambda r: ['background-color: rgba(13,143,111,0.30)'
+                       if r["Model"] == _bn else '' for _ in r], axis=1
+        ).format({"Day-ahead MAPE (%)": "{:.2f}", "Holdout MAPE (%)": "{:.2f}"},
+                 na_rep="—")
+        st.dataframe(_sty, hide_index=True, use_container_width=True)
+
+# ---- Copyright footer ----
+st.markdown(
+    f"<div class='app-footer'>© {_today.year} <b>Zobair Hossain Khan</b> · "
+    f"Load Forecast by Planning — NESCO System Planning</div>",
+    unsafe_allow_html=True,
+)
