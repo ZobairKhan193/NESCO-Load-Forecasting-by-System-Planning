@@ -106,7 +106,7 @@
     "2026-12-16": "Victory Day",
     "2026-12-25": "Christmas Day"
   },
-  "bias_correction": 9.631266968067052,
+  "bias_correction": 0,
   "trained_at": "2026-06-21T04:12:38.647708Z",
   "data_range": {
     "start": "2024-01-01 00:00:00",
