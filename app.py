@@ -265,6 +265,44 @@ def fetch_weather_forecast(start_date: str, end_date: str) -> pd.DataFrame:
               .sort_values("Time").reset_index(drop=True))
 
 
+@st.cache_data(ttl=3600, show_spinner="Loading latest demand data ...")
+def build_fresh_history(path, max_valid_demand):
+    """Read a latest_demand.csv committed to the repo, clean it, attach recent
+    archive weather, and return the last 400 hours. So the app stays fresh: just
+    upload an updated latest_demand.csv whenever you have new data — no setup."""
+    raw = pd.read_csv(path, encoding="utf-8-sig")
+    raw.columns = [c.strip().lstrip("﻿") for c in raw.columns]
+    raw["Demand"] = pd.to_numeric(raw["Demand"], errors="coerce")
+    t = pd.to_datetime(raw["Time"].astype(str).str.strip(),
+                       format="%Y-%m-%d %I:%M:%S %p", errors="coerce")
+    t = t.fillna(pd.to_datetime(raw["Time"].astype(str).str.strip(),
+                                format="%m/%d/%Y %H:%M", errors="coerce"))
+    t = t.fillna(pd.to_datetime(raw["Time"].astype(str).str.strip(), errors="coerce"))
+    raw["Time"] = t
+    raw = raw.dropna(subset=["Time"]).sort_values("Time")
+    raw = raw[(raw["Time"].dt.minute == 0) & (raw["Time"].dt.second == 0)]
+    raw = raw.groupby("Time", as_index=False)["Demand"].mean().set_index("Time")
+    full = pd.date_range(raw.index.min(), raw.index.max(), freq="h")
+    raw = raw.reindex(full); raw.index.name = "Time"
+    bad = (raw["Demand"] > max_valid_demand) | (raw["Demand"] <= 0)
+    raw.loc[bad, "Demand"] = np.nan
+    raw["Demand"] = raw["Demand"].interpolate(method="time", limit=3).ffill().bfill()
+    raw = raw.reset_index()
+    wstart = (raw["Time"].max() - pd.Timedelta(hours=440)).strftime("%Y-%m-%d")
+    wend = raw["Time"].max().strftime("%Y-%m-%d")
+    ar = requests.get("https://archive-api.open-meteo.com/v1/archive",
+                      params={"latitude": LAT, "longitude": LON,
+                              "start_date": wstart, "end_date": wend,
+                              "hourly": ",".join(WEATHER_VARS), "timezone": "Asia/Dhaka"},
+                      timeout=60)
+    ar.raise_for_status()
+    aw = pd.DataFrame(ar.json()["hourly"]); aw["time"] = pd.to_datetime(aw["time"])
+    aw = aw.rename(columns={"time": "Time"})
+    h = raw.merge(aw, on="Time", how="left")
+    h[WEATHER_VARS] = h[WEATHER_VARS].interpolate(limit=12).ffill().bfill()
+    return h.tail(400).reset_index(drop=True)
+
+
 # ============================================================
 # Feature engineering — MUST match train.ipynb exactly
 # ============================================================
@@ -289,18 +327,14 @@ def build_row_features(t, history_df, weather_row, holiday_dates):
         row[v] = float(weather_row[v])
 
     s = history_df["Demand"]
-    for k in (1, 2, 3, 24, 48, 72, 168):
+    for k in (24, 48, 72, 168):
         ts = t - pd.Timedelta(hours=k)
         if ts not in s.index:
             raise KeyError(f"Missing lag-{k} value at {ts}.")
         row[f"demand_lag_{k}"] = float(s.loc[ts])
 
-    past_6 = s.loc[(s.index >= t - pd.Timedelta(hours=6)) & (s.index < t)]
-    past_12 = s.loc[(s.index >= t - pd.Timedelta(hours=12)) & (s.index < t)]
     past_24 = s.loc[(s.index >= t - pd.Timedelta(hours=24)) & (s.index < t)]
     past_168 = s.loc[(s.index >= t - pd.Timedelta(hours=168)) & (s.index < t)]
-    row["demand_roll6_mean"] = float(past_6.mean())
-    row["demand_roll12_mean"] = float(past_12.mean())
     row["demand_roll24_mean"] = float(past_24.mean())
     row["demand_roll24_std"] = float(past_24.std())
     row["demand_roll168_mean"] = float(past_168.mean())
@@ -348,6 +382,7 @@ def run_forecast(target_day, config, feat_scaler, target_scaler, model,
     model_kind = config["model_kind"]
     lookback = config["lookback"]
     bias_corr = float(config.get("bias_correction", 0.0))
+    bias_by_hour = config.get("bias_by_hour")  # 24-value per-hour correction (preferred)
     holiday_dates = set(pd.to_datetime(list(config["holidays"].keys())).date)
 
     hist = history.copy().set_index("Time").sort_index()
@@ -410,7 +445,7 @@ def run_forecast(target_day, config, feat_scaler, target_scaler, model,
             yhat_s = float(model.predict(win_s[np.newaxis, :, :], verbose=0)[0, 0])
             yhat = float(target_scaler.inverse_transform([[yhat_s]])[0, 0])
 
-        yhat = yhat + bias_corr
+        yhat = yhat + (bias_by_hour[t.hour] if bias_by_hour else bias_corr)
         yhat = float(np.clip(yhat, 50.0, config.get("max_valid_demand", 700)))
 
         preds.append((t, yhat))
@@ -472,6 +507,24 @@ except Exception as e:
     st.stop()
 
 last_actual = history["Time"].max()
+
+# ---- Auto-refresh history from latest_demand.csv if present (no setup) ------
+# Drop a `latest_demand.csv` into the repo (same place as the artifacts) and the
+# app rebuilds history from it automatically — so it isn't stuck on the weekly
+# history_tail.csv. No URLs, no secrets. If the file isn't there, it just uses
+# the committed history_tail.csv.
+history_source = "weekly history_tail"
+_latest = next((p for p in (os.path.join(ARTIFACT_DIR, "latest_demand.csv"),
+                            os.path.join(_HERE, "latest_demand.csv"))
+                if os.path.exists(p)), None)
+if _latest:
+    try:
+        history = build_fresh_history(_latest, config.get("max_valid_demand", 700))
+        last_actual = history["Time"].max()
+        history_source = "latest_demand.csv"
+    except Exception as e:
+        st.warning(f"Could not read latest_demand.csv, using saved history. ({e})")
+
 _today = today_dhaka()
 
 with st.sidebar:
@@ -490,11 +543,13 @@ with st.sidebar:
 
     st.divider()
     st.subheader("ℹ️ Details")
+    _age_days = (_today - last_actual.date()).days
     st.markdown(
         f"""
 - **Trained:** {config.get('trained_at', 'unknown')[:10]}
-- **Data through:** {config.get('data_range', {}).get('end', 'unknown')[:10]}
 - **Last actual:** {last_actual:%Y-%m-%d %H:%M}
+- **History source:** {history_source}
+- **History age:** {_age_days} day(s)
 """
     )
 
