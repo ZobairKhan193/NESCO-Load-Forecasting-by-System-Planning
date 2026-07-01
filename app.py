@@ -31,6 +31,7 @@ import io
 import json
 import math
 import os
+import time
 from datetime import datetime, timedelta, date, timezone
 
 import joblib
@@ -248,6 +249,23 @@ def load_artifacts():
 # ============================================================
 # Weather (cached 30 min so repeated clicks don't re-hit the API)
 # ============================================================
+def _get_with_retry(url, params=None, timeout=60, tries=4):
+    """GET with exponential backoff on 429 (rate limit) and 5xx. Open-Meteo's
+    free API throttles bursts, so a transient 429 shouldn't fail the forecast."""
+    last = None
+    for i in range(tries):
+        r = requests.get(url, params=params, timeout=timeout)
+        if r.status_code == 429 or 500 <= r.status_code < 600:
+            last = r
+            if i < tries - 1:
+                time.sleep(2 ** i)   # 1s, 2s, 4s
+                continue
+        r.raise_for_status()
+        return r
+    last.raise_for_status()
+    return last
+
+
 @st.cache_data(ttl=1800, show_spinner="Fetching weather forecast ...")
 def fetch_weather_forecast(start_date: str, end_date: str) -> pd.DataFrame:
     url = "https://api.open-meteo.com/v1/forecast"
@@ -257,20 +275,25 @@ def fetch_weather_forecast(start_date: str, end_date: str) -> pd.DataFrame:
         "hourly": ",".join(WEATHER_VARS),
         "timezone": "Asia/Dhaka",
     }
-    r = requests.get(url, params=params, timeout=60)
-    r.raise_for_status()
+    r = _get_with_retry(url, params=params)
     wx = pd.DataFrame(r.json()["hourly"])
     wx["time"] = pd.to_datetime(wx["time"])
     return (wx.rename(columns={"time": "Time"})
               .sort_values("Time").reset_index(drop=True))
 
 
-@st.cache_data(ttl=3600, show_spinner="Loading latest demand data ...")
-def build_fresh_history(path, max_valid_demand):
-    """Read a latest_demand.csv committed to the repo, clean it, attach recent
-    archive weather, and return the last 400 hours. So the app stays fresh: just
-    upload an updated latest_demand.csv whenever you have new data — no setup."""
-    raw = pd.read_csv(path, encoding="utf-8-sig")
+@st.cache_data(ttl=1800, show_spinner="Loading latest demand data ...")
+def build_fresh_history(source, max_valid_demand):
+    """Build history from the latest demand CSV, clean it, attach recent archive
+    weather, and return the last 400 hours. `source` can be either a local path
+    (a committed latest_demand.csv) OR a public URL (e.g. a Google Drive
+    'anyone with the link' direct-download URL) — so the app can stay fresh by
+    pulling your live data automatically, never stuck on stale committed data."""
+    if str(source).startswith("http"):
+        r = requests.get(source, timeout=60); r.raise_for_status()
+        raw = pd.read_csv(io.BytesIO(r.content), encoding="utf-8-sig")
+    else:
+        raw = pd.read_csv(source, encoding="utf-8-sig")
     raw.columns = [c.strip().lstrip("﻿") for c in raw.columns]
     raw["Demand"] = pd.to_numeric(raw["Demand"], errors="coerce")
     t = pd.to_datetime(raw["Time"].astype(str).str.strip(),
@@ -290,12 +313,10 @@ def build_fresh_history(path, max_valid_demand):
     raw = raw.reset_index()
     wstart = (raw["Time"].max() - pd.Timedelta(hours=440)).strftime("%Y-%m-%d")
     wend = raw["Time"].max().strftime("%Y-%m-%d")
-    ar = requests.get("https://archive-api.open-meteo.com/v1/archive",
-                      params={"latitude": LAT, "longitude": LON,
-                              "start_date": wstart, "end_date": wend,
-                              "hourly": ",".join(WEATHER_VARS), "timezone": "Asia/Dhaka"},
-                      timeout=60)
-    ar.raise_for_status()
+    ar = _get_with_retry("https://archive-api.open-meteo.com/v1/archive",
+                         params={"latitude": LAT, "longitude": LON,
+                                 "start_date": wstart, "end_date": wend,
+                                 "hourly": ",".join(WEATHER_VARS), "timezone": "Asia/Dhaka"})
     aw = pd.DataFrame(ar.json()["hourly"]); aw["time"] = pd.to_datetime(aw["time"])
     aw = aw.rename(columns={"time": "Time"})
     h = raw.merge(aw, on="Time", how="left")
@@ -339,6 +360,10 @@ def build_row_features(t, history_df, weather_row, holiday_dates):
     row["demand_roll24_std"] = float(past_24.std())
     row["demand_roll168_mean"] = float(past_168.mean())
     row["demand_roll168_std"] = float(past_168.std())
+    row["trend_ratio"] = (row["demand_roll24_mean"] / row["demand_roll168_mean"]
+                          if row["demand_roll168_mean"] else 1.0)
+    row["lag24_over_lag168"] = (row["demand_lag_24"] / row["demand_lag_168"]
+                                if row["demand_lag_168"] else 1.0)
 
     for col in ("temperature_2m", "relative_humidity_2m", "precipitation"):
         ts = t - pd.Timedelta(hours=24)
@@ -383,6 +408,8 @@ def run_forecast(target_day, config, feat_scaler, target_scaler, model,
     lookback = config["lookback"]
     bias_corr = float(config.get("bias_correction", 0.0))
     bias_by_hour = config.get("bias_by_hour")  # 24-value per-hour correction (preferred)
+    ratio_mode = config.get("target_mode") == "ratio"   # predict demand/lag168, multiply back
+    base_col = config.get("ratio_baseline", "demand_lag_168")
     holiday_dates = set(pd.to_datetime(list(config["holidays"].keys())).date)
 
     hist = history.copy().set_index("Time").sort_index()
@@ -437,13 +464,15 @@ def run_forecast(target_day, config, feat_scaler, target_scaler, model,
             # Tree models were trained on RAW features — no scaling.
             row_feats = build_row_features(t, hist, wdict, holiday_dates)
             X = np.array([[row_feats[c] for c in feature_cols]], dtype=np.float32)
-            yhat = float(model.predict(X)[0])
+            raw = float(model.predict(X)[0])
+            yhat = raw * float(row_feats[base_col]) if ratio_mode else raw
         else:
             win = build_lookback_window(t, hist, weather_lookup, holiday_dates,
                                         feature_cols, lookback)
             win_s = feat_scaler.transform(win)
             yhat_s = float(model.predict(win_s[np.newaxis, :, :], verbose=0)[0, 0])
-            yhat = float(target_scaler.inverse_transform([[yhat_s]])[0, 0])
+            raw = float(target_scaler.inverse_transform([[yhat_s]])[0, 0])
+            yhat = raw * float(hist.at[t - pd.Timedelta(hours=168), "Demand"]) if ratio_mode else raw
 
         yhat = yhat + (bias_by_hour[t.hour] if bias_by_hour else bias_corr)
         yhat = float(np.clip(yhat, 50.0, config.get("max_valid_demand", 700)))
@@ -508,22 +537,30 @@ except Exception as e:
 
 last_actual = history["Time"].max()
 
-# ---- Auto-refresh history from latest_demand.csv if present (no setup) ------
-# Drop a `latest_demand.csv` into the repo (same place as the artifacts) and the
-# app rebuilds history from it automatically — so it isn't stuck on the weekly
-# history_tail.csv. No URLs, no secrets. If the file isn't there, it just uses
-# the committed history_tail.csv.
+# ---- Auto-refresh history so the app is NEVER stuck on stale data -----------
+# Priority:
+#   1. data_csv_url in Streamlit Secrets (a public Google Drive direct-download
+#      URL of your live demand CSV) -> app auto-pulls your latest data, no commits.
+#   2. a committed latest_demand.csv in the repo.
+#   3. the weekly history_tail.csv (fallback).
+# Setting the secret URL is the recommended fix: you keep ONE Drive file updated,
+# and the app always forecasts from fresh data (cache refreshes every 30 min).
 history_source = "weekly history_tail"
-_latest = next((p for p in (os.path.join(ARTIFACT_DIR, "latest_demand.csv"),
-                            os.path.join(_HERE, "latest_demand.csv"))
-                if os.path.exists(p)), None)
-if _latest:
+try:
+    _data_url = st.secrets.get("data_csv_url", "")
+except Exception:
+    _data_url = ""
+_local = next((p for p in (os.path.join(ARTIFACT_DIR, "latest_demand.csv"),
+                           os.path.join(_HERE, "latest_demand.csv"))
+               if os.path.exists(p)), None)
+_source = _data_url or _local
+if _source:
     try:
-        history = build_fresh_history(_latest, config.get("max_valid_demand", 700))
+        history = build_fresh_history(_source, config.get("max_valid_demand", 700))
         last_actual = history["Time"].max()
-        history_source = "latest_demand.csv"
+        history_source = "live (Drive URL)" if _data_url else "latest_demand.csv"
     except Exception as e:
-        st.warning(f"Could not read latest_demand.csv, using saved history. ({e})")
+        st.warning(f"Could not load fresh data ({e}); using saved history.")
 
 _today = today_dhaka()
 
